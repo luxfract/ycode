@@ -158,9 +158,6 @@ function webflowSummaryMessage(summary: ImportSummary): string {
   return `Imported ${parts.join(', ')}`;
 }
 
-// Shown at most once per session: nagging on every paste would be noise.
-let noStylesheetHintShown = false;
-
 export function useImportPaste({
   enabled,
   insertLayers,
@@ -180,6 +177,23 @@ export function useImportPaste({
     const toastId = toast.loading('Pasting from Webflow…');
     try {
       const { css, reason } = await loadSiteStylesheetCss();
+
+      // Require a connected published site before the first paste. Without the
+      // global stylesheet the paste would create bare, unstyled layer styles
+      // (no colours, fonts or var resolution), and a later re-paste can't
+      // upgrade those in place — it only spawns suffixed duplicates. So we stop
+      // here and send the user to connect their site first.
+      if (reason === 'no-site') {
+        toast.error('Connect your Webflow site to paste', {
+          id: toastId,
+          description:
+            'Add your published site URL under Webflow → Design so pasted designs include global styles, colours and fonts.',
+          action: { label: 'Connect', onClick: openWebflowSettings },
+          duration: 10_000,
+        });
+        return;
+      }
+
       const globalStyles = css ? parseGlobalStylesheet(css) : undefined;
       const document = parseWebflowClipboard(text, globalStyles);
       if (!document) {
@@ -210,18 +224,6 @@ export function useImportPaste({
       insertLayers(layers, placement);
 
       toast.success(webflowSummaryMessage(summary), { id: toastId });
-
-      // No published site connected → the paste rendered without global styles
-      // (section backgrounds, heading/text colours, fonts). Nudge once.
-      if (reason === 'no-site' && !noStylesheetHintShown) {
-        noStylesheetHintShown = true;
-        toast.message('Connect your published site for full styling', {
-          description:
-            'Add your Webflow site URL so pasted designs pick up global styles, colours and fonts.',
-          action: { label: 'Connect', onClick: openWebflowSettings },
-          duration: 10_000,
-        });
-      }
 
       // Collections can't be auto-connected on paste — they live in your CMS.
       // Point the user at the migration flow rather than leaving placeholders.
