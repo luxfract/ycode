@@ -27,8 +27,8 @@ import { getClassesString, hasPasswordFormLayer } from '@/lib/layer-utils';
 import { buildGlobalsMetaMap, buildGlobalsValueMap } from '@/lib/collection-field-utils';
 import { buildLocalizedPageUrls, type LocalizedDynamicSlug } from '@/lib/page-utils';
 import { getTranslatableKey } from '@/lib/locale-runtime';
-import { getTranslationsByLocale } from '@/lib/repositories/translationRepository';
-import type { Layer, Component, Page, CollectionItemWithValues, CollectionField, Locale, PageFolder, PasswordProtectionContext, Translation } from '@/types';
+import { getSlugTranslationsByLocale } from '@/lib/repositories/translationRepository';
+import type { Layer, BackgroundsDesign, Component, Page, CollectionItemWithValues, CollectionField, Locale, PageFolder, PasswordProtectionContext, Translation } from '@/types';
 
 interface PageLinkRef { collection_item_id: string; page_id: string }
 
@@ -140,10 +140,59 @@ function extractCollectionItemSlugs(layers: Layer[]): Record<string, string> {
 }
 
 /**
+ * The public renderer styles layers from their compiled `classes`; the structured
+ * `design` object is builder-only metadata used to regenerate those classes in the
+ * editor. The only part read at render time is `design.backgrounds.bgImageVars` /
+ * `bgGradientVars`, which are applied as inline CSS custom properties (see
+ * LayerRendererPublic and lib/page-fetcher). Everything else — including
+ * `backgroundColor` / `backgroundClip` (already baked into `classes`) — is dropped.
+ * On a content-heavy page the full design tree can be ~30% of the serialized RSC
+ * Flight payload.
+ */
+function stripDesignForClient(design: Layer['design']): Layer['design'] | undefined {
+  const backgrounds = design?.backgrounds;
+  if (!backgrounds) return undefined;
+  const slim: BackgroundsDesign = {};
+  if (backgrounds.bgImageVars) slim.bgImageVars = backgrounds.bgImageVars;
+  if (backgrounds.bgGradientVars) slim.bgGradientVars = backgrounds.bgGradientVars;
+  if (!slim.bgImageVars && !slim.bgGradientVars) return undefined;
+  return { backgrounds: slim };
+}
+
+/**
+ * Rich-text inline styles (`textStyles`) are applied at render time via their
+ * compiled `classes` (see getTextStyleClasses). The accompanying `design`,
+ * `styleOverrides`, `styleId`, and `label` are builder-only, so keep just `classes`.
+ *
+ * We must preserve an entry whenever its `classes` is a string — even an empty one.
+ * `getTextStyleClasses` does `textStyles?.[key]?.classes ?? DEFAULT_TEXT_STYLES[...]`,
+ * so an explicit `classes: ''` suppresses the default, whereas an absent entry falls
+ * back to it. Dropping empty-string entries would silently re-introduce default
+ * styling. Entries with no `classes` string already resolve to the default, so
+ * omitting them is equivalent to keeping them.
+ */
+function stripTextStylesForClient(textStyles: Layer['textStyles']): Layer['textStyles'] | undefined {
+  if (!textStyles) return undefined;
+  const slim: NonNullable<Layer['textStyles']> = {};
+  let kept = false;
+  for (const [key, style] of Object.entries(textStyles)) {
+    if (typeof style?.classes === 'string') {
+      slim[key] = { classes: style.classes };
+      kept = true;
+    }
+  }
+  return kept ? slim : undefined;
+}
+
+/**
  * Strip heavy SSR-only data from the layer tree before passing to client
  * components. After resolveCollectionLayers, all variables are pre-resolved
  * into the layers — _collectionItemValues and _layerDataMap are redundant
- * and can be enormous (e.g. 50 articles × full rich text bodies).
+ * and can be enormous (e.g. 50 articles × full rich text bodies). All builder-only
+ * style metadata (`design`, `styleIds`, `styleId`, `styleOverrides`,
+ * `styleOverridesByStyle`, and per-`textStyles` design) is likewise dropped — the
+ * published `classes` strings are already fully resolved, so the client never needs
+ * to re-resolve them (see stripDesignForClient / stripTextStylesForClient).
  *
  * The RSC Flight payload serializes everything passed to 'use client'
  * components, so stripping here avoids doubling the response size.
@@ -155,6 +204,27 @@ function stripSSROnlyData(layers: Layer[]): Layer[] {
     delete stripped._collectionItemValues;
     delete stripped._collectionItemSlug;
     delete stripped._layerDataMap;
+
+    // Builder-only style resolution inputs. The flat `classes` string is the
+    // already-resolved output, so the public renderer never reads these.
+    delete stripped.styleIds;
+    delete stripped.styleId;
+    delete stripped.styleOverrides;
+    delete stripped.styleOverridesByStyle;
+
+    const slimDesign = stripDesignForClient(stripped.design);
+    if (slimDesign) {
+      stripped.design = slimDesign;
+    } else {
+      delete stripped.design;
+    }
+
+    const slimTextStyles = stripTextStylesForClient(stripped.textStyles);
+    if (slimTextStyles) {
+      stripped.textStyles = slimTextStyles;
+    } else {
+      delete stripped.textStyles;
+    }
 
     if (stripped._filterConfig?.layerTemplate) {
       stripped._filterConfig = {
@@ -451,7 +521,9 @@ export default async function PageRenderer({
               translationsByLocale[l.id] = translations as Record<string, Translation>;
               return;
             }
-            const rows = await getTranslationsByLocale(l.id, usePublishedData);
+            // Only slug rows are needed to build localized URLs for the locale
+            // switcher — avoid loading the full CMS-content catalogue per locale.
+            const rows = await getSlugTranslationsByLocale(l.id, usePublishedData);
             const map: Record<string, Translation> = {};
             for (const t of rows) {
               map[getTranslatableKey(t)] = t;
@@ -791,6 +863,7 @@ export default async function PageRenderer({
         data-layer-id="body"
         data-layer-type="div"
         data-is-empty={hasLayers ? 'false' : 'true'}
+        lang={(locale?.code || availableLocales.find((l) => l.is_default)?.code) || undefined}
       >
         <LayerRendererPublic
           layers={childLayers}
